@@ -46,7 +46,8 @@ async function fromList() {
   const text = await res.text();
   const prefix = `${REPO}@${BRANCH}/`;
   const paths = [];
-  for (const m of text.matchAll(/url:\s*["']([^"']+)["']/g)) {
+  const urls = /url:\s*["']([^"']+)["']/g;
+  for (let m; (m = urls.exec(text)); ) {
     const i = m[1].indexOf(prefix);
     if (i >= 0) paths.push(decodeURI(m[1].slice(i + prefix.length)));
   }
@@ -77,7 +78,22 @@ async function loadCatalog() {
   return (catalog = build(files));
 }
 
-const collator = new Intl.Collator("zh-CN", { numeric: true });
+// The app's JavaScript has no Intl, so names are sorted by hand: runs of digits
+// by their value, everything else by code point.
+const collator = {
+  compare(a, b) {
+    const pa = a.match(/\d+|\D+/g) || [];
+    const pb = b.match(/\d+|\D+/g) || [];
+    for (let i = 0; i < Math.min(pa.length, pb.length); i++) {
+      const x = pa[i];
+      const y = pb[i];
+      if (x === y) continue;
+      if (/^\d/.test(x) && /^\d/.test(y)) return Number(x) - Number(y) || x.length - y.length;
+      return x < y ? -1 : 1;
+    }
+    return pa.length - pb.length;
+  },
+};
 
 function build(files) {
   const tracks = new Map();
