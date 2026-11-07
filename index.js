@@ -9,6 +9,8 @@ const RAW = `https://raw.githubusercontent.com/${REPO}/${BRANCH}/`;
 // jsDelivr won't serve a file of a GitHub repository over 20 MB.
 const CDN_LIMIT = 20 * 1024 * 1024;
 const CATALOG_TTL = 24 * 60 * 60 * 1000;
+// The fallback list has no sizes, so GitHub is tried again sooner.
+const PARTIAL_TTL = 60 * 60 * 1000;
 const RECENT_MAX = 50;
 
 const t = (text) => host.t(text);
@@ -60,7 +62,10 @@ let catalog = null;
 async function loadCatalog() {
   if (catalog) return catalog;
   const cached = host.storage.get("catalog");
-  if (cached && Date.now() - cached.time < CATALOG_TTL) return (catalog = build(cached.files));
+  const partial = (files) => files.some((f) => !f.size);
+  if (cached && Date.now() - cached.time < (partial(cached.files) ? PARTIAL_TTL : CATALOG_TTL)) {
+    return (catalog = build(cached.files));
+  }
   let files;
   for (const source of [fromTree, fromList]) {
     try {
@@ -304,9 +309,89 @@ export async function stationNext({ id }) {
   return tracksOf(shuffle(await allIds()).slice(0, 20));
 }
 
+// Lyrics, from LRCLIB (https://lrclib.net). Only timed ones: the app leaves out
+// lines of LRC without a time. A live recording is timed apart from the
+// studio one, so the version from the song's own album is picked first.
+
+const LYRICS_MISS_TTL = 7 * 24 * 60 * 60 * 1000;
+const key = (s) => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
+// Album folders whose names LRCLIB writes otherwise.
+const ALBUM_KEYS = { "Imagine-2011": "imagine", io: "io" };
+
+function albumMatches(folder, albumName) {
+  const want = ALBUM_KEYS[folder] || key(folder);
+  const got = key(albumName || "");
+  return want.length < 2 ? got === want : got.includes(want);
+}
+
+async function findLyrics(name, folder) {
+  // A medley, such as 杭州&我们不能失去信仰, has no lyrics of its own.
+  if (/[&＆+＋]/.test(name)) return null;
+  // What's in brackets says which version it is, as in 山阴路的夏天 (相信未来版),
+  // and some names carry the singer, a date or a dedication besides.
+  const title =
+    name
+      .replace(/\s*[(（[【].*?[)）\]】]\s*/g, "")
+      .replace(/^李志\s*[-–—]+\s*/, "")
+      .replace(/\s*[-–—]+\s*李志$/, "")
+      .replace(/[—–].*$/, "")
+      .replace(/\s*\d{4}(\.\d{1,2}\.\d{1,2})?$/, "")
+      .trim() || name;
+  const url = `https://lrclib.net/api/search?track_name=${encodeURIComponent(title)}&artist_name=${encodeURIComponent("李志")}`;
+  const res = await fetch(url, { headers: { "lrclib-client": "mygo-lizhi (https://github.com/djyde/mygo-lizhi)" } });
+  if (!res.ok) throw new Error(`LRCLIB ${res.status}`);
+  // LRCLIB's names have their versions in brackets too, as in 妈妈 (2014现场版),
+  // or the Chinese name there, as in Mama (妈妈).
+  const names = (n) => {
+    const out = [n, n.replace(/[(（[【].*?[)）\]】]/g, "")];
+    const inside = /[(（[【](.*?)[)）\]】]/g;
+    for (let m; (m = inside.exec(n)); ) out.push(m[1]);
+    return out.map(key);
+  };
+  const found = (await res.json()).filter(
+    (r) => r.syncedLyrics && (r.artistName || "").includes("李志") && names(r.trackName || "").includes(key(title)),
+  );
+  if (!found.length) return null;
+  const best = found.find((r) => albumMatches(folder, r.albumName)) || found[0];
+  return best.syncedLyrics;
+}
+
+export async function lyrics({ id }) {
+  const cached = host.storage.get(`lyrics:${id}`);
+  if (cached && (cached.lrc || Date.now() - cached.time < LYRICS_MISS_TTL)) {
+    return cached.lrc ? { lrc: cached.lrc } : {};
+  }
+  const { tracks } = await loadCatalog();
+  const entry = tracks.get(id);
+  if (!entry) return {};
+  let lrc;
+  try {
+    lrc = await findLyrics(entry.track.name, entry.track.album.id);
+  } catch (e) {
+    // Busy or out of reach: no lyrics this time, and try again next time.
+    console.log(`lyrics: ${e.message}`);
+    return {};
+  }
+  host.storage.set(`lyrics:${id}`, lrc ? { lrc } : { time: Date.now() });
+  return lrc ? { lrc } : {};
+}
+
 // Audio.
 
 const TYPES = { mp3: "mp3", flac: "flac", wav: "wav" };
+
+// The player works out a song's length from the file's size, so when the
+// catalog came without sizes, the CDN is asked for it.
+async function sizeOf(url) {
+  try {
+    const res = await fetch(url, { method: "HEAD" });
+    if (!res.ok) return 0;
+    return Number(res.headers.get("content-length")) || 0;
+  } catch (e) {
+    console.log(`size: ${e.message}`);
+    return 0;
+  }
+}
 
 export async function stream({ id }) {
   const { tracks } = await loadCatalog();
@@ -314,5 +399,11 @@ export async function stream({ id }) {
   if (!entry) throw fail("unavailable", `no song ${id}`);
   const ext = id.match(AUDIO)[1].toLowerCase();
   const base = entry.size > CDN_LIMIT ? RAW : CDN;
-  return { url: base + encodePath(id), type: TYPES[ext], ...(entry.size ? { size: entry.size } : {}) };
+  const url = base + encodePath(id);
+  if (!entry.size) entry.size = host.storage.get(`size:${id}`) || 0;
+  if (!entry.size) {
+    entry.size = await sizeOf(url);
+    if (entry.size) host.storage.set(`size:${id}`, entry.size);
+  }
+  return { url, type: TYPES[ext], ...(entry.size ? { size: entry.size } : {}) };
 }
